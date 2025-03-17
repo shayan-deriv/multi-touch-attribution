@@ -36,6 +36,7 @@ interface PageViewEvent {
     attribution: AttributionData; // Attribution data for this visit
     uuid: string;             // Unique identifier for this browser/device
     is_loggedin: boolean;     // Whether the user was logged in during this visit
+    event_id: string;         // Unique identifier for this event
 }
 
 /**
@@ -47,6 +48,9 @@ interface UserJourneyTrackerOptions {
     maxEvents?: number;       // Maximum number of events to store
     resetOnLogin?: boolean;   // Whether to reset tracking data when user logs in
     resetOnSignup?: boolean;  // Whether to reset tracking data when user signs up
+    autoTrack?: boolean;      // Whether to automatically track page views
+    trackHashChange?: boolean; // Whether to track hash changes in SPAs
+    trackHistoryChange?: boolean; // Whether to track history API changes in SPAs
 }
 
 /**
@@ -63,6 +67,8 @@ class UserJourneyTracker {
     private derivUserId: string | null = null; // User ID after login/signup
     private isLoggedIn: boolean = false;   // Whether the user is currently logged in
     private oldUuid: string | null = null; // Previous UUID before signup (for cross-device tracking)
+    private lastTrackedUrl: string = '';   // Last URL that was tracked
+    private currentPageEventId: string | null = null; // ID of the current page event
 
     /**
      * Constructor - sets up the tracker with default or custom options
@@ -76,6 +82,9 @@ class UserJourneyTracker {
             maxEvents: 100,
             resetOnLogin: true,
             resetOnSignup: true,
+            autoTrack: true,       // Auto-track by default
+            trackHashChange: true, // Track hash changes by default
+            trackHistoryChange: true, // Track history changes by default
             ...options
         };
 
@@ -98,7 +107,7 @@ class UserJourneyTracker {
     }
 
     /**
-     * Generate a UUID v4 for uniquely identifying this browser/device
+     * Generate a UUID v4 for uniquely identifying this browser/device or event
      * This is used to track the same user across multiple visits
      * @returns A randomly generated UUID v4 string
      */
@@ -222,16 +231,77 @@ class UserJourneyTracker {
         // Load existing events from storage
         this.loadEvents();
 
-        // Track the current page view immediately with current known state
-        // We'll assume logged out initially if not specified
-        this.trackCurrentPageView();
-
-        // Add event listener for future navigation (browser back/forward buttons)
-        if (typeof window !== 'undefined') {
-            window.addEventListener('popstate', () => this.trackCurrentPageView());
+        // Set up auto-tracking if enabled
+        if (this.options.autoTrack) {
+            this.setupAutoTracking();
         }
 
         this.isInitialized = true;
+    }
+
+    /**
+     * Set up auto-tracking for page views
+     * This adds event listeners for various navigation events in SPAs
+     */
+    private setupAutoTracking(): void {
+        if (typeof window === 'undefined') return;
+
+        // Store initial URL
+        this.lastTrackedUrl = window.location.href;
+
+        // Track initial page view
+        this.trackCurrentPageView();
+
+        // Track popstate events (browser back/forward buttons)
+        window.addEventListener('popstate', () => {
+            // Only track if URL has changed
+            if (window.location.href !== this.lastTrackedUrl) {
+                this.lastTrackedUrl = window.location.href;
+                this.trackCurrentPageView();
+            }
+        });
+
+        // Track hash changes if enabled
+        if (this.options.trackHashChange) {
+            window.addEventListener('hashchange', () => {
+                // Only track if URL has changed
+                if (window.location.href !== this.lastTrackedUrl) {
+                    this.lastTrackedUrl = window.location.href;
+                    this.trackCurrentPageView();
+                }
+            });
+        }
+
+        // Track history API changes if enabled
+        if (this.options.trackHistoryChange) {
+            // Save original methods
+            const originalPushState = history.pushState;
+            const originalReplaceState = history.replaceState;
+
+            // Override pushState
+            history.pushState = (...args) => {
+                // Call original method
+                originalPushState.apply(history, args);
+
+                // Track the new state
+                if (window.location.href !== this.lastTrackedUrl) {
+                    this.lastTrackedUrl = window.location.href;
+                    this.trackCurrentPageView();
+                }
+            };
+
+            // Override replaceState
+            history.replaceState = (...args) => {
+                // Call original method
+                originalReplaceState.apply(history, args);
+
+                // Track the new state
+                if (window.location.href !== this.lastTrackedUrl) {
+                    this.lastTrackedUrl = window.location.href;
+                    this.trackCurrentPageView();
+                }
+            };
+        }
     }
 
     /**
@@ -253,29 +323,24 @@ class UserJourneyTracker {
             }
         }
 
-        // If login state changed and we have events, update the most recent event
-        if (previousState !== isLoggedIn && this.events.length > 0) {
-            this.updateMostRecentEventLoginState(isLoggedIn);
+        // If we have a current page event ID, update its login state
+        if (this.currentPageEventId) {
+            this.updateEventLoginState(this.currentPageEventId, isLoggedIn);
         }
     }
 
     /**
-     * Update the login state of the most recent event
-     * This ensures the current page view has the correct login state
-     * @param isLoggedIn The current login state
+     * Update the login state of a specific event
+     * @param eventId The ID of the event to update
+     * @param isLoggedIn The new login state
      */
-    private updateMostRecentEventLoginState(isLoggedIn: boolean): void {
-        if (this.events.length === 0) return;
+    private updateEventLoginState(eventId: string, isLoggedIn: boolean): void {
+        // Find the event with the matching ID
+        const eventIndex = this.events.findIndex(event => event.event_id === eventId);
 
-        // Get the most recent event
-        const mostRecentEvent = this.events[this.events.length - 1];
-
-        // Check if this is the current page view (within last minute)
-        const isCurrentPageView = (Date.now() - mostRecentEvent.timestamp) < 60000;
-
-        if (isCurrentPageView) {
-            // Update the login state of the most recent event
-            mostRecentEvent.is_loggedin = isLoggedIn;
+        if (eventIndex !== -1) {
+            // Update the login state
+            this.events[eventIndex].is_loggedin = isLoggedIn;
 
             // Save the updated events
             this.saveEvents();
@@ -283,9 +348,9 @@ class UserJourneyTracker {
     }
 
     /**
-     * Parse URL parameters to extract attribution data
-     * This captures all UTM parameters, click IDs, and referrer information
-     * @returns Attribution data extracted from the current URL
+     * Parse attribution data from the current URL
+     * This extracts UTM parameters, click IDs, and referrer information
+     * @returns Attribution data object
      */
     private parseAttributionData(): AttributionData {
         if (typeof window === 'undefined') return {};
@@ -293,42 +358,63 @@ class UserJourneyTracker {
         const url = new URL(window.location.href);
         const params = url.searchParams;
 
-        // Extract all possible attribution parameters
-        const attribution: AttributionData = {
-            utm_campaign: params.get('utm_campaign') || undefined,
-            utm_medium: params.get('utm_medium') || undefined,
-            utm_source: params.get('utm_source') || undefined,
-            utm_term: params.get('utm_term') || undefined,
-            utm_ad_id: params.get('utm_ad_id') || undefined,
-            utm_ad_group_id: params.get('utm_ad_group_id') || undefined,
-            utm_campaign_id: params.get('utm_campaign_id') || undefined,
-            gclid: params.get('gclid') || undefined,
-            fbclid: params.get('fbclid') || undefined,
-            mkclid: params.get('mkclid') || undefined,
-            referrer: document.referrer || undefined,
-            landing_page: window.location.href
-        };
+        const attribution: AttributionData = {};
 
-        // Filter out undefined values
-        return Object.fromEntries(
-            Object.entries(attribution).filter(([_, v]) => v !== undefined)
-        ) as AttributionData;
+        // Extract UTM parameters
+        const utmParams = [
+            'utm_campaign', 'utm_medium', 'utm_source', 'utm_term',
+            'utm_ad_id', 'utm_ad_group_id', 'utm_campaign_id'
+        ];
+
+        utmParams.forEach(param => {
+            const value = params.get(param);
+            if (value) {
+                attribution[param as keyof AttributionData] = value;
+            }
+        });
+
+        // Extract click IDs
+        const clickIds = ['gclid', 'fbclid', 'mkclid'];
+        clickIds.forEach(param => {
+            const value = params.get(param);
+            if (value) {
+                attribution[param as keyof AttributionData] = value;
+            }
+        });
+
+        // Add referrer if available
+        if (document.referrer) {
+            try {
+                const referrerUrl = new URL(document.referrer);
+                // Only store referrer if it's from a different domain
+                if (referrerUrl.hostname !== window.location.hostname) {
+                    attribution.referrer = document.referrer;
+                }
+            } catch (e) {
+                // Invalid referrer URL, ignore
+            }
+        }
+
+        // Add landing page
+        attribution.landing_page = window.location.pathname;
+
+        return attribution;
     }
 
     /**
-     * Check if this is a new attribution source
+     * Check if this is a new attribution source worth tracking
      * This prevents duplicate entries for the same source
      * @param attribution The attribution data to check
      * @returns True if this is a new attribution source
      */
     private isNewAttributionSource(attribution: AttributionData): boolean {
-        // If no events, this is definitely a new source
+        // Always track if this is the first event
         if (this.events.length === 0) return true;
 
-        // Get the most recent event
+        // Get the last event
         const lastEvent = this.events[this.events.length - 1];
 
-        // Check if this is a different page
+        // Always track if URL has changed
         if (lastEvent.url !== window.location.href) return true;
 
         // Check if this has new attribution data
@@ -356,6 +442,9 @@ class UserJourneyTracker {
         // Only track if this is a new attribution source
         // This prevents duplicate entries for the same source
         if (this.isNewAttributionSource(attribution)) {
+            // Generate a unique ID for this event
+            const eventId = this.generateUUID();
+
             const event: PageViewEvent = {
                 url: window.location.href,
                 timestamp: Date.now(),
@@ -363,8 +452,12 @@ class UserJourneyTracker {
                 title: document.title || undefined,
                 attribution: attribution,
                 uuid: this.uuid,
-                is_loggedin: this.isLoggedIn
+                is_loggedin: this.isLoggedIn,
+                event_id: eventId
             };
+
+            // Store the current page event ID for potential updates
+            this.currentPageEventId = eventId;
 
             this.addEvent(event);
         }
@@ -464,6 +557,9 @@ class UserJourneyTracker {
             history.pushState({}, title || '', url);
         }
 
+        // Update last tracked URL
+        this.lastTrackedUrl = window.location.href;
+
         // Track the page view with the updated URL
         this.trackCurrentPageView();
     }
@@ -480,6 +576,11 @@ class UserJourneyTracker {
         // Store the user ID for future reference
         if (typeof window !== 'undefined') {
             localStorage.setItem(`${this.storageKey}_user_id`, derivUserId);
+        }
+
+        // Update the current page event if it exists
+        if (this.currentPageEventId) {
+            this.updateEventLoginState(this.currentPageEventId, true);
         }
 
         // Reset events if configured to do so
@@ -512,6 +613,11 @@ class UserJourneyTracker {
             if (this.oldUuid) {
                 localStorage.setItem(`${this.storageKey}_old_uuid`, this.oldUuid);
             }
+        }
+
+        // Update the current page event if it exists
+        if (this.currentPageEventId) {
+            this.updateEventLoginState(this.currentPageEventId, true);
         }
 
         // Reset events if configured to do so
