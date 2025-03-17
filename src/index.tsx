@@ -22,6 +22,7 @@ interface AttributionData {
     mkclid?: string;          // Microsoft/Bing Click ID for ads tracking
     referrer?: string;        // The URL from which the user arrived
     landing_page?: string;    // The page user lands on
+    attribution_timestamp?: number; // When this attribution data was first captured
 }
 
 /**
@@ -51,6 +52,7 @@ interface UserJourneyTrackerOptions {
     autoTrack?: boolean;      // Whether to automatically track page views
     trackHashChange?: boolean; // Whether to track hash changes in SPAs
     trackHistoryChange?: boolean; // Whether to track history API changes in SPAs
+    attributionExpiry?: number; // How long to persist attribution data (in minutes)
 }
 
 /**
@@ -69,6 +71,7 @@ class UserJourneyTracker {
     private oldUuid: string | null = null; // Previous UUID before signup (for cross-device tracking)
     private lastTrackedUrl: string = '';   // Last URL that was tracked
     private currentPageEventId: string | null = null; // ID of the current page event
+    private currentAttribution: AttributionData = {}; // Current attribution data to persist
 
     /**
      * Constructor - sets up the tracker with default or custom options
@@ -85,11 +88,15 @@ class UserJourneyTracker {
             autoTrack: true,       // Auto-track by default
             trackHashChange: true, // Track hash changes by default
             trackHistoryChange: true, // Track history changes by default
+            attributionExpiry: 30 * 24 * 60, // 30 days in minutes
             ...options
         };
 
         // Generate or retrieve UUID from cookie
         this.uuid = this.getOrCreateUUID();
+
+        // Load persisted attribution data
+        this.loadAttributionData();
     }
 
     /**
@@ -231,76 +238,253 @@ class UserJourneyTracker {
         // Load existing events from storage
         this.loadEvents();
 
+        // Load persisted attribution data
+        this.loadAttributionData();
+
         // Set up auto-tracking if enabled
-        if (this.options.autoTrack) {
+        if (this.options.autoTrack && typeof window !== 'undefined') {
             this.setupAutoTracking();
         }
+
+        // Track the current page view
+        this.trackCurrentPageView();
 
         this.isInitialized = true;
     }
 
     /**
-     * Set up auto-tracking for page views
-     * This adds event listeners for various navigation events in SPAs
+     * Set up automatic tracking for page views
+     * This handles various navigation methods in both traditional and single-page apps
      */
     private setupAutoTracking(): void {
         if (typeof window === 'undefined') return;
 
-        // Store initial URL
-        this.lastTrackedUrl = window.location.href;
-
-        // Track initial page view
-        this.trackCurrentPageView();
-
-        // Track popstate events (browser back/forward buttons)
-        window.addEventListener('popstate', () => {
-            // Only track if URL has changed
-            if (window.location.href !== this.lastTrackedUrl) {
-                this.lastTrackedUrl = window.location.href;
-                this.trackCurrentPageView();
-            }
-        });
-
-        // Track hash changes if enabled
-        if (this.options.trackHashChange) {
-            window.addEventListener('hashchange', () => {
-                // Only track if URL has changed
-                if (window.location.href !== this.lastTrackedUrl) {
-                    this.lastTrackedUrl = window.location.href;
-                    this.trackCurrentPageView();
-                }
-            });
-        }
-
-        // Track history API changes if enabled
+        // Track history API changes (pushState/replaceState)
         if (this.options.trackHistoryChange) {
-            // Save original methods
             const originalPushState = history.pushState;
             const originalReplaceState = history.replaceState;
+            const self = this;
 
             // Override pushState
-            history.pushState = (...args) => {
-                // Call original method
-                originalPushState.apply(history, args);
-
-                // Track the new state
-                if (window.location.href !== this.lastTrackedUrl) {
-                    this.lastTrackedUrl = window.location.href;
-                    this.trackCurrentPageView();
-                }
+            history.pushState = function (state, title, url) {
+                originalPushState.call(this, state, title, url);
+                self.trackPageView();
             };
 
             // Override replaceState
-            history.replaceState = (...args) => {
-                // Call original method
-                originalReplaceState.apply(history, args);
-
-                // Track the new state
-                if (window.location.href !== this.lastTrackedUrl) {
-                    this.lastTrackedUrl = window.location.href;
-                    this.trackCurrentPageView();
-                }
+            history.replaceState = function (state, title, url) {
+                originalReplaceState.call(this, state, title, url);
+                self.trackPageView();
             };
+        }
+
+        // Track hash changes
+        if (this.options.trackHashChange) {
+            window.addEventListener('hashchange', () => this.trackPageView());
+        }
+
+        // Track browser back/forward navigation
+        window.addEventListener('popstate', () => this.trackPageView());
+    }
+
+    /**
+     * Parse attribution data from the current URL
+     * This extracts UTM parameters, click IDs, and other attribution information
+     * @returns Attribution data object
+     */
+    private parseAttributionData(): AttributionData {
+        if (typeof window === 'undefined') return {};
+
+        const url = new URL(window.location.href);
+        const params = url.searchParams;
+        const attribution: AttributionData = {};
+
+        // Extract UTM parameters
+        const utmParams = [
+            'utm_source', 'utm_medium', 'utm_campaign', 'utm_term',
+            'utm_ad_id', 'utm_ad_group_id', 'utm_campaign_id'
+        ];
+
+        utmParams.forEach(param => {
+            const value = params.get(param);
+            if (value) {
+                (attribution as any)[param] = value;
+            }
+        });
+
+        // Extract click IDs
+        const clickIds = ['gclid', 'fbclid', 'mkclid'];
+        clickIds.forEach(param => {
+            const value = params.get(param);
+            if (value) {
+                (attribution as any)[param] = value;
+            }
+        });
+
+        // Add referrer if available
+        if (document.referrer) {
+            try {
+                const referrerUrl = new URL(document.referrer);
+                // Only store external referrers
+                if (referrerUrl.hostname !== window.location.hostname) {
+                    attribution.referrer = document.referrer;
+                }
+            } catch (e) {
+                // Invalid referrer URL
+            }
+        }
+
+        // Add landing page
+        attribution.landing_page = window.location.pathname;
+
+        // Add timestamp when this attribution data was captured
+        attribution.attribution_timestamp = Date.now();
+
+        return attribution;
+    }
+
+    /**
+     * Check if the current URL has new attribution data
+     * @param newAttribution The attribution data from the current URL
+     * @returns True if this is a new attribution source
+     */
+    private hasNewAttributionData(newAttribution: AttributionData): boolean {
+        // Check if we have any UTM parameters or click IDs
+        const attributionParams = [
+            'utm_source', 'utm_medium', 'utm_campaign', 'utm_term',
+            'utm_ad_id', 'utm_ad_group_id', 'utm_campaign_id',
+            'gclid', 'fbclid', 'mkclid'
+        ];
+
+        return attributionParams.some(param =>
+            newAttribution[param as keyof AttributionData] !== undefined
+        );
+    }
+
+    /**
+     * Save the current attribution data to localStorage
+     * This allows us to persist attribution across page views
+     */
+    private saveAttributionData(): void {
+        if (typeof window === 'undefined' || !this.currentAttribution) return;
+
+        try {
+            localStorage.setItem(
+                `${this.storageKey}_attribution`,
+                JSON.stringify(this.currentAttribution)
+            );
+        } catch (e) {
+            console.error('Failed to save attribution data:', e);
+        }
+    }
+
+    /**
+     * Load saved attribution data from localStorage
+     * This restores attribution data across page views
+     */
+    private loadAttributionData(): void {
+        if (typeof window === 'undefined') return;
+
+        try {
+            const savedAttribution = localStorage.getItem(`${this.storageKey}_attribution`);
+            if (savedAttribution) {
+                const attribution = JSON.parse(savedAttribution);
+
+                // Check if the attribution data is still valid (not expired)
+                if (attribution.attribution_timestamp) {
+                    const now = Date.now();
+                    const ageInMinutes = (now - attribution.attribution_timestamp) / (1000 * 60);
+
+                    if (ageInMinutes <= (this.options.attributionExpiry as number)) {
+                        this.currentAttribution = attribution;
+                    } else {
+                        // Attribution data has expired, clear it
+                        localStorage.removeItem(`${this.storageKey}_attribution`);
+                    }
+                } else {
+                    this.currentAttribution = attribution;
+                }
+            }
+        } catch (e) {
+            console.error('Failed to load attribution data:', e);
+        }
+    }
+
+    /**
+     * Get the attribution data for the current page view
+     * This combines new attribution data from the URL with persisted attribution data
+     * @returns The attribution data to use for the current page view
+     */
+    private getAttributionForPageView(): AttributionData {
+        // Parse attribution data from the current URL
+        const urlAttribution = this.parseAttributionData();
+
+        // Check if we have new attribution data in the URL
+        if (this.hasNewAttributionData(urlAttribution)) {
+            // We have new attribution data, update and persist it
+            this.currentAttribution = urlAttribution;
+            this.saveAttributionData();
+            return urlAttribution;
+        }
+
+        // No new attribution data, use the persisted attribution if available
+        if (Object.keys(this.currentAttribution).length > 0) {
+            // Add the current page as landing_page
+            return {
+                ...this.currentAttribution,
+                landing_page: window.location.pathname
+            };
+        }
+
+        // No persisted attribution either, just return the basic data
+        return urlAttribution;
+    }
+
+    /**
+     * Track the current page view
+     * This implements the "Tracking Events for Every User Visit" approach
+     */
+    private trackCurrentPageView(): void {
+        if (typeof window === 'undefined') return;
+
+        // Skip if we're tracking the same URL again
+        if (this.lastTrackedUrl === window.location.href) return;
+        this.lastTrackedUrl = window.location.href;
+
+        // Get attribution data for this page view
+        const attribution = this.getAttributionForPageView();
+
+        // Generate a unique ID for this event
+        const eventId = this.generateUUID();
+
+        // Create the page view event
+        const event: PageViewEvent = {
+            url: window.location.href,
+            timestamp: Date.now(),
+            referrer: document.referrer || undefined,
+            title: document.title || undefined,
+            attribution: attribution,
+            uuid: this.uuid,
+            is_loggedin: this.isLoggedIn,
+            event_id: eventId
+        };
+
+        // Store the current page event ID for potential updates
+        this.currentPageEventId = eventId;
+
+        this.addEvent(event);
+    }
+
+    /**
+     * Update the login state of a specific event
+     * @param eventId The ID of the event to update
+     * @param isLoggedIn The new login state
+     */
+    private updateEventLoginState(eventId: string, isLoggedIn: boolean): void {
+        const eventIndex = this.events.findIndex(event => event.event_id === eventId);
+        if (eventIndex !== -1) {
+            this.events[eventIndex].is_loggedin = isLoggedIn;
+            this.saveEvents();
         }
     }
 
@@ -323,143 +507,9 @@ class UserJourneyTracker {
             }
         }
 
-        // If we have a current page event ID, update its login state
-        if (this.currentPageEventId) {
+        // If login state changed and we have a current page event, update it
+        if (previousState !== isLoggedIn && this.currentPageEventId) {
             this.updateEventLoginState(this.currentPageEventId, isLoggedIn);
-        }
-    }
-
-    /**
-     * Update the login state of a specific event
-     * @param eventId The ID of the event to update
-     * @param isLoggedIn The new login state
-     */
-    private updateEventLoginState(eventId: string, isLoggedIn: boolean): void {
-        // Find the event with the matching ID
-        const eventIndex = this.events.findIndex(event => event.event_id === eventId);
-
-        if (eventIndex !== -1) {
-            // Update the login state
-            this.events[eventIndex].is_loggedin = isLoggedIn;
-
-            // Save the updated events
-            this.saveEvents();
-        }
-    }
-
-    /**
-     * Parse attribution data from the current URL
-     * This extracts UTM parameters, click IDs, and referrer information
-     * @returns Attribution data object
-     */
-    private parseAttributionData(): AttributionData {
-        if (typeof window === 'undefined') return {};
-
-        const url = new URL(window.location.href);
-        const params = url.searchParams;
-
-        const attribution: AttributionData = {};
-
-        // Extract UTM parameters
-        const utmParams = [
-            'utm_campaign', 'utm_medium', 'utm_source', 'utm_term',
-            'utm_ad_id', 'utm_ad_group_id', 'utm_campaign_id'
-        ];
-
-        utmParams.forEach(param => {
-            const value = params.get(param);
-            if (value) {
-                attribution[param as keyof AttributionData] = value;
-            }
-        });
-
-        // Extract click IDs
-        const clickIds = ['gclid', 'fbclid', 'mkclid'];
-        clickIds.forEach(param => {
-            const value = params.get(param);
-            if (value) {
-                attribution[param as keyof AttributionData] = value;
-            }
-        });
-
-        // Add referrer if available
-        if (document.referrer) {
-            try {
-                const referrerUrl = new URL(document.referrer);
-                // Only store referrer if it's from a different domain
-                if (referrerUrl.hostname !== window.location.hostname) {
-                    attribution.referrer = document.referrer;
-                }
-            } catch (e) {
-                // Invalid referrer URL, ignore
-            }
-        }
-
-        // Add landing page
-        attribution.landing_page = window.location.pathname;
-
-        return attribution;
-    }
-
-    /**
-     * Check if this is a new attribution source worth tracking
-     * This prevents duplicate entries for the same source
-     * @param attribution The attribution data to check
-     * @returns True if this is a new attribution source
-     */
-    private isNewAttributionSource(attribution: AttributionData): boolean {
-        // Always track if this is the first event
-        if (this.events.length === 0) return true;
-
-        // Get the last event
-        const lastEvent = this.events[this.events.length - 1];
-
-        // Always track if URL has changed
-        if (lastEvent.url !== window.location.href) return true;
-
-        // Check if this has new attribution data
-        const hasNewAttribution = Object.entries(attribution).some(([key, value]) => {
-            // Skip referrer and landing_page in comparison
-            if (key === 'referrer' || key === 'landing_page') return false;
-
-            // Check if this parameter is new or different
-            return value && lastEvent.attribution[key as keyof AttributionData] !== value;
-        });
-
-        return hasNewAttribution;
-    }
-
-    /**
-     * Track the current page view if it has a new attribution source
-     * This implements the "Tracking Events for Every User Visit" approach
-     */
-    private trackCurrentPageView(): void {
-        if (typeof window === 'undefined') return;
-
-        // Extract attribution data from the current URL
-        const attribution = this.parseAttributionData();
-
-        // Only track if this is a new attribution source
-        // This prevents duplicate entries for the same source
-        if (this.isNewAttributionSource(attribution)) {
-            // Generate a unique ID for this event
-            const eventId = this.generateUUID();
-
-            const event: PageViewEvent = {
-                url: window.location.href,
-                timestamp: Date.now(),
-                referrer: document.referrer || undefined,
-                title: document.title || undefined,
-                attribution: attribution,
-                uuid: this.uuid,
-                is_loggedin: this.isLoggedIn,
-                event_id: eventId
-            };
-
-            // Store the current page event ID for potential updates
-            this.currentPageEventId = eventId;
-
-            this.addEvent(event);
         }
     }
 
@@ -556,9 +606,6 @@ class UserJourneyTracker {
         if (url) {
             history.pushState({}, title || '', url);
         }
-
-        // Update last tracked URL
-        this.lastTrackedUrl = window.location.href;
 
         // Track the page view with the updated URL
         this.trackCurrentPageView();

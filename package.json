@@ -1,6 +1,6 @@
 {
   "name": "user-journey-tracker",
-  "version": "0.1.2",
+  "version": "0.1.4",
   "description": "Track user pageviews before signup to understand their journey",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
