@@ -61,7 +61,7 @@ interface UserJourneyTrackerOptions {
  */
 class UserJourneyTracker {
     // API endpoint constant - hardcoded within the library
-    private readonly API_ENDPOINT: string = '/api/analytics/events';
+    private readonly API_ENDPOINT: string = 'https://x6pr-kqwm-lfqn.n7d.xano.io/api:XrZOQHwS:v1/user_events';
 
     private options: UserJourneyTrackerOptions;
     private events: PageViewEvent[] = [];  // Array of tracked page view events
