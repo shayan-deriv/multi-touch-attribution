@@ -60,6 +60,9 @@ interface UserJourneyTrackerOptions {
  * Implements the multi-touch attribution model described in the tracking plan
  */
 class UserJourneyTracker {
+    // API endpoint constant - hardcoded within the library
+    private readonly API_ENDPOINT: string = '/api/analytics/events';
+
     private options: UserJourneyTrackerOptions;
     private events: PageViewEvent[] = [];  // Array of tracked page view events
     private storageKey: string = 'user_journey_history';  // Fixed storage key
@@ -180,11 +183,7 @@ class UserJourneyTracker {
      * Delete a cookie by name
      * @param name Cookie name
      */
-    private deleteCookie(name: string): void {
-        if (typeof window === 'undefined') return;
-
-        this.setCookie(name, '', -1);
-    }
+    //
 
     /**
      * Get existing UUID from cookie or create a new one if none exists
@@ -510,14 +509,21 @@ class UserJourneyTracker {
         // If login state changed and we have a current page event, update it
         if (previousState !== isLoggedIn && this.currentPageEventId) {
             this.updateEventLoginState(this.currentPageEventId, isLoggedIn);
+
+            // Find the event and send the updated version to backend
+            const updatedEvent = this.events.find(event => event.event_id === this.currentPageEventId);
+            if (updatedEvent) {
+                this.sendEventToBackend(updatedEvent);
+            }
         }
     }
 
     /**
-     * Add a page view event to history and save to storage
+     * Add a page view event to history, save to storage, and send to backend
      * @param event The page view event to add
      */
     private addEvent(event: PageViewEvent): void {
+        // Add to local storage
         this.events.push(event);
 
         // Trim events if exceeding max count to prevent storage issues
@@ -527,6 +533,43 @@ class UserJourneyTracker {
 
         // Save updated events to storage
         this.saveEvents();
+
+        // Immediately send to backend
+        this.sendEventToBackend(event);
+    }
+
+    /**
+     * Send a single event to the backend API
+     * @param event The event to send
+     */
+    private async sendEventToBackend(event: PageViewEvent): Promise<void> {
+        try {
+            // Prepare the payload
+            const payload = {
+                uuid: this.uuid,
+                deriv_user_id: this.derivUserId || undefined,
+                old_uuid: this.oldUuid || undefined,
+                event: event,
+                timestamp: Date.now()
+            };
+
+            // Send the event to the backend
+            const response = await fetch(this.API_ENDPOINT, {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json'
+                },
+                body: JSON.stringify(payload),
+                // Use credentials to include cookies in cross-origin requests
+                credentials: 'include'
+            });
+
+            if (!response.ok) {
+                console.error('Failed to send event to backend:', response.statusText);
+            }
+        } catch (error) {
+            console.error('Error sending event to backend:', error);
+        }
     }
 
     /**
@@ -628,6 +671,12 @@ class UserJourneyTracker {
         // Update the current page event if it exists
         if (this.currentPageEventId) {
             this.updateEventLoginState(this.currentPageEventId, true);
+
+            // Find the event and send the updated version to backend
+            const updatedEvent = this.events.find(event => event.event_id === this.currentPageEventId);
+            if (updatedEvent) {
+                this.sendEventToBackend(updatedEvent);
+            }
         }
 
         // Reset events if configured to do so
@@ -665,6 +714,12 @@ class UserJourneyTracker {
         // Update the current page event if it exists
         if (this.currentPageEventId) {
             this.updateEventLoginState(this.currentPageEventId, true);
+
+            // Find the event and send the updated version to backend
+            const updatedEvent = this.events.find(event => event.event_id === this.currentPageEventId);
+            if (updatedEvent) {
+                this.sendEventToBackend(updatedEvent);
+            }
         }
 
         // Reset events if configured to do so
